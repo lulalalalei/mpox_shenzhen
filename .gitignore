@@ -1,4 +1,7 @@
-data/
+data/*
+!data/who/
+data/who/*
+!data/who/README.md
 outputs/
 __pycache__/
 *.pyc
@@ -15,6 +18,7 @@ __pycache__/
 *.tif
 *.tiff
 *.svg
+!data/who/WHO_global_mpox_cases_2025-12-31.csv
 *.shp
 *.shx
 *.dbf
