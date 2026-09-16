@@ -1,6 +1,6 @@
 # Bayesian mpox importation model
 
-This directory contains the reproducible code for the Shenzhen mpox importation analysis. It contains no surveillance records, passenger data, population data, posterior files, or generated figures.
+This directory contains the reproducible code for the Shenzhen mpox importation analysis. It includes frozen public snapshots of WHO surveillance data and World Bank population data; passenger data, posterior files, and generated figures are not included.
 
 ## Files
 
@@ -13,7 +13,7 @@ This directory contains the reproducible code for the Shenzhen mpox importation 
 
 ## Input layout
 
-The scripts read user-supplied files through command-line arguments. Keep those files outside the public repository or place them under the ignored `data/` directory.
+The scripts read input files through command-line arguments. The tracked public snapshots under `data/who/` and `data/population/` are included for provenance; other input files should remain outside the public repository or under the ignored parts of `data/`.
 
 The case directory contains one CSV per source country. Each file must contain `date,cases`; the aliases `dates,reported_cases` are also accepted.
 
@@ -21,14 +21,14 @@ The transport-capacity file must contain source country, flight date, and seats.
 
 The monthly-passenger file must contain source country, month, and passenger count. The original column names `Dep Country Name`, `Time Series`, and `Total Est. Pax` are accepted.
 
-The population file must contain country and population. The original columns `Country Name` and `2024` are accepted.
+The population file must contain country and population. The original columns `Country Name` and `2024` are accepted. The included snapshot is `data/population/World_Bank_population_2024.csv`.
 
 The optional observed-case file must contain weekly or daily dates and imported-case counts. It is used only for the calibration panel.
 
 ## Run
 
 ```bash
-python run_all.py --cases-dir data/cases --transport-capacity-file data/Transport_capacity.csv --monthly-passenger-file data/Passenger.csv --population-file data/population.csv --observed-file data/observed_imported_cases.csv --world-shapefile data/world.shp --country-map-file data/country_iso3.csv --output-dir outputs
+python run_all.py --cases-dir data/cases --transport-capacity-file data/Transport_capacity.csv --monthly-passenger-file data/Passenger.csv --population-file data/population/World_Bank_population_2024.csv --observed-file data/observed_imported_cases.csv --world-shapefile data/world.shp --country-map-file data/country_iso3.csv --output-dir outputs
 ```
 
 The default sampler uses four chains, 2,000 tuning iterations per chain, and 2,000 retained posterior draws per chain. These can be changed from the command line.

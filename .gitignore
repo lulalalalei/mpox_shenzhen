@@ -2,6 +2,9 @@ data/*
 !data/who/
 data/who/*
 !data/who/README.md
+!data/population/
+data/population/*
+!data/population/README.md
 outputs/
 __pycache__/
 *.pyc
@@ -19,6 +22,7 @@ __pycache__/
 *.tiff
 *.svg
 !data/who/WHO_global_mpox_cases_2025-12-31.csv
+!data/population/World_Bank_population_2024.csv
 *.shp
 *.shx
 *.dbf
