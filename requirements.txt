@@ -1,0 +1,8 @@
+numpy>=1.26
+pandas>=2.0
+scipy>=1.11
+pymc>=5.10
+arviz>=0.16
+matplotlib>=3.8
+pillow>=10.0
+geopandas>=0.14
