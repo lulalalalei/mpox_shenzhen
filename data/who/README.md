@@ -18,4 +18,4 @@ WHO may revise historical records. Re-downloading the API today may therefore pr
 
 Variables are country, date, ISO3 code, WHO region, confirmed and probable case counts, confirmed and probable death counts, and their new-count fields. The file contains no individual-level records or direct identifiers.
 
-The file is included to support reproduction of the country-level case-series preparation. Mobility data and Shenzhen aggregate surveillance data are not included because they are subject to their own data-access or licensing conditions.
+The file is included to support reproduction of the country-level case-series preparation.
