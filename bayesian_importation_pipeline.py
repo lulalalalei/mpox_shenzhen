@@ -3,6 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import hashlib
+import warnings
+from importlib.metadata import version
+from countries import canonical_country
 from pathlib import Path
 
 import arviz as az
@@ -107,13 +111,13 @@ def load_weekly_cases(
     frame = pd.read_csv(path)
     frame.columns = frame.columns.astype(str).str.strip()
     date_column = next(
-        (name for name in ("date", "dates", "Date", "Dates") if name in frame.columns),
+        (name for name in ("date", "dates", "Date", "Dates", "DATE") if name in frame.columns),
         None,
     )
     case_column = next(
         (
             name
-            for name in ("cases", "reported_cases", "Cases", "reported cases")
+            for name in ("cases", "reported_cases", "Cases", "reported cases", "NEW_CONF_CASES")
             if name in frame.columns
         ),
         None,
@@ -125,8 +129,9 @@ def load_weekly_cases(
     )
     frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
     frame["cases"] = pd.to_numeric(frame["cases"], errors="coerce")
-    frame = frame.dropna().loc[lambda x: x["cases"] >= 0]
-    frame["cases"] = frame["cases"].round().astype(int)
+    if frame.isna().any().any() or (frame["cases"] < 0).any() or not np.equal(frame["cases"], np.floor(frame["cases"])).all():
+        raise ValueError(f"{path}: invalid dates or non-negative integer case counts.")
+    frame["cases"] = frame["cases"].astype(int)
     daily = frame.groupby("date")["cases"].sum()
     calendar = pd.date_range(start, end, freq="D")
     daily = daily.reindex(calendar, fill_value=0)
@@ -172,11 +177,12 @@ def load_weekly_passengers(path: Path) -> pd.DataFrame:
             passenger_column: "passengers",
         }
     )
-    frame["country"] = frame["country"].astype(str).str.strip()
+    frame["country"] = frame["country"].map(canonical_country)
     frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
     frame["passengers"] = pd.to_numeric(frame["passengers"], errors="coerce")
     frame = frame.dropna()
-    frame = frame.loc[frame["passengers"] >= 0].copy()
+    if (frame["passengers"] < 0).any():
+        raise ValueError("Passenger counts must be non-negative.")
     frame["date"] = frame["date"] - pd.to_timedelta(frame["date"].dt.weekday, unit="D")
     return (
         frame.groupby(["country", "date"], as_index=False)["passengers"]
@@ -208,7 +214,7 @@ def load_population(path: Path, population_column: str | None = None) -> dict[st
     frame[population_column] = pd.to_numeric(frame[population_column], errors="coerce")
     frame = frame.dropna(subset=[country_column, population_column])
     frame = frame.loc[frame[population_column] > 0]
-    return dict(zip(frame[country_column].astype(str).str.strip(), frame[population_column].astype(float)))
+    return dict(zip(frame[country_column].map(canonical_country), frame[population_column].astype(float)))
 
 
 def adaptive_initial_state(observed_cases: np.ndarray) -> tuple[float, float]:
@@ -226,7 +232,10 @@ def fit_country(
     max_treedepth: int = 10,
     seed: int = 2026,
 ) -> az.InferenceData:
-    observed_cases = np.asarray(observed_cases, dtype=np.int64)
+    observed_cases = np.asarray(observed_cases)
+    if not np.isfinite(observed_cases).all() or (observed_cases < 0).any() or not np.equal(observed_cases, np.floor(observed_cases)).all():
+        raise ValueError("Case counts must be finite non-negative integers.")
+    observed_cases = observed_cases.astype(np.int64)
     n_weeks = len(observed_cases)
     if n_weeks < 10 or observed_cases.sum() <= 0:
         raise ValueError("The weekly case series must contain at least 10 weeks and one case.")
@@ -243,13 +252,14 @@ def fit_country(
             pt.clip(pt.dot(convolution, incidence), 1e-8, np.inf),
         )
         pm.Poisson("reported_cases", mu=reporting_rate, observed=observed_cases)
-        step = pm.NUTS(target_accept=target_accept, max_treedepth=max_treedepth)
         idata = pm.sample(
             draws=draws,
             tune=tune,
             chains=chains,
             cores=min(chains, os.cpu_count() or 1),
-            step=step,
+            nuts_sampler="nutpie",
+            nuts={"target_accept": target_accept},
+            nuts_sampler_kwargs={"maxdepth": max_treedepth, "adaptation": "low_rank"},
             random_seed=seed,
             progressbar=True,
             compute_convergence_checks=True,
@@ -264,9 +274,32 @@ def fit_country(
             "target_accept": float(target_accept),
             "max_treedepth": int(max_treedepth),
             "complete_posterior_draws": 1,
+            "sampling_backend": "nutpie",
+            "nutpie_version": version("nutpie"),
+            "pymc_version": pm.__version__,
+            "nutpie_adaptation": "low_rank",
         }
     )
     return idata
+
+
+def save_posterior(idata: az.InferenceData, path: Path) -> None:
+    for group_name in idata.groups():
+        dataset = getattr(idata, group_name)
+        for name in list(dataset.data_vars):
+            if np.issubdtype(dataset[name].dtype, np.bool_):
+                dataset[name] = dataset[name].astype(np.int8)
+        for name, value in list(dataset.attrs.items()):
+            if isinstance(value, (bool, np.bool_)):
+                dataset.attrs[name] = int(value)
+            elif isinstance(value, (dict, list, tuple, set)):
+                dataset.attrs[name] = json.dumps(value, default=str)
+    for name, value in list(idata.attrs.items()):
+        if isinstance(value, (dict, list, tuple, set)):
+            idata.attrs[name] = json.dumps(value, default=str)
+        elif isinstance(value, (bool, np.bool_)):
+            idata.attrs[name] = int(value)
+    idata.to_netcdf(path)
 
 
 def save_diagnostics(
@@ -276,68 +309,83 @@ def save_diagnostics(
     ess_threshold: float = 400.0,
     rhat_threshold: float = 1.01,
     bfmi_threshold: float = 0.30,
+    tail_ess_threshold: float = 400.0,
+    plots: bool = True,
 ) -> dict[str, object]:
     output_dir.mkdir(parents=True, exist_ok=True)
     summary = az.summary(
         idata,
-        var_names=["sigma_rw", "log_I0", "I", "lambda_report"],
+        var_names=["sigma_rw", "log_I0", "I"],
         kind="diagnostics",
+        round_to=4,
     )
     summary.to_csv(output_dir / f"{safe_name(country)}_diagnostics.csv")
-    max_rhat = float(np.nanmax(summary["r_hat"].to_numpy()))
-    min_bulk_ess = float(np.nanmin(summary["ess_bulk"].to_numpy()))
-    min_tail_ess = float(np.nanmin(summary["ess_tail"].to_numpy()))
+    rhat_values = summary["r_hat"].to_numpy()
+    bulk_values = summary["ess_bulk"].to_numpy()
+    tail_values = summary["ess_tail"].to_numpy()
+    max_rhat = float(rhat_values.max()) if np.isfinite(rhat_values).all() else np.nan
+    min_bulk_ess = float(bulk_values.min()) if np.isfinite(bulk_values).all() else np.nan
+    min_tail_ess = float(tail_values.min()) if np.isfinite(tail_values).all() else np.nan
     divergences = int(idata.sample_stats["diverging"].sum().values)
-    if "tree_depth" in idata.sample_stats:
-        tree_depth = idata.sample_stats["tree_depth"].to_numpy()
+    depth_name = "tree_depth" if "tree_depth" in idata.sample_stats else "depth" if "depth" in idata.sample_stats else None
+    if depth_name is not None:
+        tree_depth = idata.sample_stats[depth_name].to_numpy()
         max_tree_depth = int(np.nanmax(tree_depth))
         max_tree_depth_hits = int(np.sum(tree_depth >= int(idata.posterior.attrs["max_treedepth"])))
     else:
         max_tree_depth = np.nan
         max_tree_depth_hits = np.nan
     try:
-        min_bfmi = float(np.nanmin(np.asarray(az.bfmi(idata))))
+        bfmi_values = np.asarray(az.bfmi(idata))
+        min_bfmi = float(bfmi_values.min()) if np.isfinite(bfmi_values).all() else np.nan
     except Exception:
         min_bfmi = np.nan
-    diagnostic_pass = bool(
-        max_rhat <= rhat_threshold
-        and min_bulk_ess >= ess_threshold
-        and min_tail_ess >= ess_threshold
-        and divergences == 0
-        and (np.isnan(min_bfmi) or min_bfmi >= bfmi_threshold)
-        and (np.isnan(max_tree_depth_hits) or max_tree_depth_hits == 0)
-    )
-    selected_coords = None
-    time_dims = [dim for dim in idata.posterior["I"].dims if dim not in {"chain", "draw"}]
-    if len(time_dims) == 1:
-        time_dim = time_dims[0]
-        n_weeks = idata.posterior["I"].sizes[time_dim]
-        selected_coords = {time_dim: sorted({0, n_weeks // 2, n_weeks - 1})}
-    import matplotlib.pyplot as plt
+    failures = []
+    for passed, reason in [
+        (np.isfinite(max_rhat) and max_rhat < rhat_threshold, "rhat"),
+        (np.isfinite(min_bulk_ess) and min_bulk_ess >= ess_threshold, "bulk_ess"),
+        (np.isfinite(min_tail_ess) and min_tail_ess >= tail_ess_threshold, "tail_ess"),
+        (divergences == 0, "divergences"),
+        (np.isfinite(min_bfmi) and min_bfmi >= bfmi_threshold, "bfmi"),
+        (np.isfinite(max_tree_depth_hits) and max_tree_depth_hits == 0, "tree_depth"),
+    ]:
+        if not passed:
+            failures.append(reason)
+    diagnostic_pass = not failures
+    if plots:
+        selected_coords = None
+        time_dims = [dim for dim in idata.posterior["I"].dims if dim not in {"chain", "draw"}]
+        if len(time_dims) == 1:
+            time_dim = time_dims[0]
+            n_weeks = idata.posterior["I"].sizes[time_dim]
+            selected_coords = {time_dim: sorted({0, n_weeks // 2, n_weeks - 1})}
+        import matplotlib.pyplot as plt
 
-    try:
-        az.plot_trace(
-            idata,
-            var_names=["sigma_rw", "log_I0", "I"],
-            coords=selected_coords,
-            compact=True,
-            combined=False,
-        )
-        plt.gcf().savefig(output_dir / f"{safe_name(country)}_trace.png", dpi=180, bbox_inches="tight")
-        plt.close("all")
-    except Exception:
-        plt.close("all")
-    try:
-        az.plot_rank(
-            idata,
-            var_names=["sigma_rw", "log_I0", "I"],
-            coords=selected_coords,
-            kind="vlines",
-        )
-        plt.gcf().savefig(output_dir / f"{safe_name(country)}_rank.png", dpi=180, bbox_inches="tight")
-        plt.close("all")
-    except Exception:
-        plt.close("all")
+        try:
+            az.plot_trace(
+                idata,
+                var_names=["sigma_rw", "log_I0", "I"],
+                coords=selected_coords,
+                compact=True,
+                combined=False,
+            )
+            plt.gcf().savefig(output_dir / f"{safe_name(country)}_trace.png", dpi=180, bbox_inches="tight")
+            plt.close("all")
+        except Exception as error:
+            plt.close("all")
+            warnings.warn(f"{country}: diagnostic plot could not be generated: {error}", RuntimeWarning)
+        try:
+            az.plot_rank(
+                idata,
+                var_names=["sigma_rw", "log_I0", "I"],
+                coords=selected_coords,
+                kind="vlines",
+            )
+            plt.gcf().savefig(output_dir / f"{safe_name(country)}_rank.png", dpi=180, bbox_inches="tight")
+            plt.close("all")
+        except Exception as error:
+            plt.close("all")
+            warnings.warn(f"{country}: diagnostic plot could not be generated: {error}", RuntimeWarning)
     result = {
         "country": country,
         "n_chains": int(idata.posterior.sizes["chain"]),
@@ -351,8 +399,19 @@ def save_diagnostics(
         "max_tree_depth_hits": max_tree_depth_hits,
         "min_bfmi": min_bfmi,
         "diagnostic_pass": diagnostic_pass,
+        "failed_criteria": ";".join(failures),
+        "tail_ess_threshold": tail_ess_threshold,
     }
     return result
+
+
+def save_predictive_summary(idata: az.InferenceData, cases: pd.Series, output_dir: Path, country: str, seed: int) -> None:
+    rate = idata.posterior["lambda_report"].values.reshape(-1, len(cases))
+    if not np.isfinite(rate).all() or (rate < 0).any():
+        raise ValueError(f"{country}: invalid posterior predictive rates.")
+    predictive = np.random.default_rng(seed).poisson(np.clip(rate, 0, 1e7))
+    frame = pd.DataFrame({"date": cases.index, "reported_cases": cases.to_numpy(), "ppc_reported_median": np.median(predictive, axis=0), "ppc_reported_lower_95": np.quantile(predictive, .025, axis=0), "ppc_reported_upper_95": np.quantile(predictive, .975, axis=0)})
+    frame.to_csv(output_dir / f"{safe_name(country)}_ppc.csv", index=False)
 
 
 def safe_name(value: str) -> str:
@@ -424,7 +483,16 @@ def run_pipeline(
     target_accept: float,
     max_treedepth: int,
     seed: int,
+    tail_ess_threshold: float = 400.0,
+    posterior_input_dir: Path | None = None,
+    diagnostic_plots: bool = True,
 ) -> None:
+    if start > end or start.dayofweek != 0 or end.dayofweek != 6:
+        raise ValueError("Use a Monday start and Sunday end, with start <= end.")
+    if not 0 < reporting_threshold <= 1 or tail_ess_threshold <= 0:
+        raise ValueError("Reporting completeness and tail ESS thresholds are invalid.")
+    if posterior_input_dir is not None and (incubation_meanlog, incubation_sdlog, reporting_meanlog, reporting_sdlog) != (2.001, .234, 1.6057319, .5964992):
+        raise ValueError("Archived posterior reuse requires the original delay parameters.")
     files = sorted(cases_dir.glob("*.csv"))
     if not files:
         raise FileNotFoundError(f"No case CSV files found in {cases_dir}.")
@@ -452,25 +520,60 @@ def run_pipeline(
     country_probability = []
     diagnostics = []
     for index, case_file in enumerate(files):
-        country = case_file.stem
+        country = canonical_country(case_file.stem)
+        panel = passengers.loc[passengers["country"].eq(country), ["date", "passengers"]].copy()
         weekly_cases = load_weekly_cases(case_file, start, end)
+        if panel["passengers"].sum() <= 0:
+            continue
+        if weekly_cases.sum() <= 0:
+            diagnostics.append({"country": country, "diagnostic_pass": False, "failed_criteria": "no_reported_cases"})
+            continue
         if country not in populations:
             raise ValueError(f"Population data are missing for {country}.")
-        idata = fit_country(
-            weekly_cases.to_numpy(),
-            delay_pmf,
-            chains=chains,
-            tune=tune,
-            draws=draws,
-            target_accept=target_accept,
-            max_treedepth=max_treedepth,
-            seed=seed + index,
-        )
         posterior_file = posterior_dir / f"{safe_name(country)}.nc"
-        idata.to_netcdf(posterior_file)
-        diagnostics.append(
-            save_diagnostics(idata, diagnostics_dir, country)
-        )
+        if posterior_input_dir is None:
+            idata = fit_country(
+                weekly_cases.to_numpy(), delay_pmf, chains=chains, tune=tune,
+                draws=draws, target_accept=target_accept, max_treedepth=max_treedepth,
+                seed=seed + sum(ord(character) for character in country),
+            )
+            idata.posterior.attrs["case_counts_sha256"] = hashlib.sha256(weekly_cases.to_numpy(dtype=np.int64).tobytes()).hexdigest()
+            idata.posterior.attrs["analysis_start"] = str(start.date())
+            idata.posterior.attrs["analysis_end"] = str(end.date())
+            save_posterior(idata, posterior_file)
+        else:
+            candidates = [posterior_input_dir / f"{country}_posterior.nc", posterior_input_dir / f"{safe_name(country)}.nc"]
+            found = next((path for path in candidates if path.exists()), None)
+            if found is None:
+                raise FileNotFoundError(f"No saved posterior for {country} in {posterior_input_dir}")
+            idata = az.from_netcdf(found)
+            for group in idata.groups():
+                dataset = getattr(idata, group)
+                dataset.load()
+                dataset.close()
+            if str(idata.posterior.attrs.get("inference_library", "")) != "nutpie":
+                raise ValueError(f"{country}: saved posterior does not identify nutpie.")
+            if idata.posterior.sizes.get("chain") != chains or idata.posterior.sizes.get("draw") != draws:
+                raise ValueError(f"{country}: saved chain/draw dimensions differ from requested settings.")
+            observed_names = list(idata.observed_data.data_vars) if hasattr(idata, "observed_data") else []
+            if len(observed_names) != 1 or not np.array_equal(idata.observed_data[observed_names[0]].values, weekly_cases.to_numpy()):
+                raise ValueError(f"{country}: saved posterior observations do not match the current case series.")
+            if idata.posterior["I"].shape[-1] != len(weekly_cases):
+                raise ValueError(f"{country}: saved posterior has a different weekly calendar length.")
+            if float(idata.posterior.attrs.get("target_accept", np.nan)) != target_accept:
+                raise ValueError(f"{country}: saved target_accept differs from requested value.")
+            saved_depth = idata.posterior.attrs.get("max_treedepth", idata.posterior.attrs.get("max_treedepth_requested"))
+            if saved_depth is None or int(saved_depth) != max_treedepth:
+                raise ValueError(f"{country}: saved maximum tree depth differs from requested value.")
+            for key, expected in [("analysis_start", str(start.date())), ("analysis_end", str(end.date()))]:
+                if key in idata.posterior.attrs and idata.posterior.attrs[key] != expected:
+                    raise ValueError(f"{country}: saved {key} differs from requested calendar.")
+            idata.posterior.attrs["max_treedepth"] = max_treedepth
+        diagnostic = save_diagnostics(idata, diagnostics_dir, country, tail_ess_threshold=tail_ess_threshold, plots=diagnostic_plots)
+        diagnostics.append(diagnostic)
+        if not diagnostic["diagnostic_pass"]:
+            continue
+        save_predictive_summary(idata, weekly_cases, diagnostics_dir, country, seed + sum(ord(character) for character in country) + 1)
         incidence_draws = posterior_incidence_draws(idata)
         panel = passengers.loc[passengers["country"].eq(country), ["date", "passengers"]].copy()
         _, expected_imports, probability = propagate_country_draws(
@@ -484,10 +587,17 @@ def run_pipeline(
             country_dates = weekly_cases.index
         elif not country_dates.equals(weekly_cases.index):
             raise ValueError("Country case series do not share the same weekly calendar.")
+        if country in country_names:
+            raise ValueError(f"Duplicate case series after country harmonisation: {country}")
+        if not np.isfinite(incidence_draws).all() or not np.isfinite(expected_imports).all():
+            raise ValueError(f"{country}: non-finite posterior propagation.")
         country_names.append(country)
         country_incidence.append(incidence_draws)
         country_expected.append(expected_imports)
         country_probability.append(probability)
+    pd.DataFrame(diagnostics).to_csv(output_dir / "screening_audit.csv", index=False)
+    if not country_expected:
+        raise ValueError("No source countries passed the diagnostic screen. See screening_audit.csv.")
     draw_counts = {array.shape[0] for array in country_expected}
     if len(draw_counts) != 1:
         raise ValueError("All countries must have the same number of posterior draws.")
@@ -497,6 +607,8 @@ def run_pipeline(
     dates = pd.DatetimeIndex(country_dates)
     completeness = reporting_completeness(delay_pmf, len(dates))
     mature_mask = completeness >= reporting_threshold
+    if not mature_mask.any():
+        raise ValueError("No weeks satisfy the reporting-completeness threshold.")
     right_truncated = ~mature_mask
     total_expected = expected_array.sum(axis=0)
     total_probability = -np.expm1(-total_expected)
@@ -634,6 +746,23 @@ def run_pipeline(
         "interval_method": "complete_posterior_draws",
         "poisson_probability_transform": "-expm1(-lambda)",
         "marginal_interval_resampling": False,
+        "sampling_backend": "nutpie",
+        "nutpie_version": version("nutpie"),
+        "pymc_version": pm.__version__,
+        "tail_ess_threshold": tail_ess_threshold,
+        "bulk_ess_threshold": 400,
+        "rhat_threshold_exclusive": 1.01,
+        "base_seed": seed,
+        "incubation_meanlog": incubation_meanlog,
+        "incubation_sdlog": incubation_sdlog,
+        "reporting_meanlog": reporting_meanlog,
+        "reporting_sdlog": reporting_sdlog,
+        "incubation_lag_weeks": incubation_lag_weeks,
+        "reporting_completeness_threshold": reporting_threshold,
+        "country_names": country_names,
+        "country_seed_rule": "base_seed + sum(ord(character) for character in country)",
+        "delay_discretisation": "daily CDF differences, discrete convolution, consecutive seven-day sums",
+        "posterior_input_dir": str(posterior_input_dir) if posterior_input_dir else None,
         "analysis_start": str(start.date()),
         "analysis_end": str(end.date()),
     }
@@ -664,6 +793,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-accept", type=float, default=0.95)
     parser.add_argument("--max-treedepth", type=int, default=10)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--tail-ess-threshold", type=float, default=400.0)
+    parser.add_argument("--posterior-input-dir", type=Path, default=None)
+    parser.add_argument("--skip-diagnostic-plots", action="store_true")
     return parser.parse_args()
 
 
@@ -689,6 +821,9 @@ def main() -> None:
         target_accept=args.target_accept,
         max_treedepth=args.max_treedepth,
         seed=args.seed,
+        tail_ess_threshold=args.tail_ess_threshold,
+        posterior_input_dir=args.posterior_input_dir,
+        diagnostic_plots=not args.skip_diagnostic_plots,
     )
 
 

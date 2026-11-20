@@ -43,18 +43,19 @@ def make_temporal_figure(model_dir: Path, figure_dir: Path) -> None:
         linewidth=0,
     )
     ax.plot(x, weekly["probability_mean"] * 100, color="#b91c1c", linewidth=2.1)
-    peak = weekly.loc[weekly["probability_mean"].idxmax()]
+    mature = weekly.loc[~weekly["right_truncated"].astype(bool)]
+    peak = mature.loc[mature["probability_mean"].idxmax()]
     ax.scatter([peak["date"]], [peak["probability_mean"] * 100], color="#7f1d1d", s=18, zorder=4)
     ax.annotate(
         f"Peak {peak['probability_mean'] * 100:.2f}%\n"
         f"95% CrI {peak['probability_q025'] * 100:.2f}-{peak['probability_q975'] * 100:.2f}%",
         xy=(peak["date"], peak["probability_mean"] * 100),
-        xytext=(pd.Timestamp("2024-12-15"), max(weekly["probability_q975"].max() * 100 * 0.85, 0.2)),
+        xytext=(weekly["date"].iloc[int(len(weekly)*.65)], max(weekly["probability_q975"].max() * 100 * 0.85, 0.2)),
         arrowprops={"arrowstyle": "-", "color": "#7f1d1d", "linewidth": 0.8},
         fontsize=8,
     )
     ax.set_ylabel("Probability (%)")
-    ax.set_title("A. Overall weekly probability of at least one imported case", loc="left", fontweight="bold")
+    ax.set_title("A. Overall weekly probability of at least one introduction", loc="left", fontweight="bold")
     style_axes(ax)
     colors = ["#006d77", "#c2410c", "#6d28d9", "#db2777", "#4d7c0f", "#0284c7"]
     ax = axes[1]
@@ -119,18 +120,8 @@ def make_country_figure(model_dir: Path, figure_dir: Path) -> None:
     top = summary.head(12).sort_values("cumulative_expected_imports_mean")
     fig, ax = plt.subplots(figsize=(8.0, 5.4))
     y = np.arange(len(top))
-    ax.errorbar(
-        top["cumulative_expected_imports_mean"],
-        y,
-        xerr=[
-            top["cumulative_expected_imports_mean"] - top["cumulative_expected_imports_q025"],
-            top["cumulative_expected_imports_q975"] - top["cumulative_expected_imports_mean"],
-        ],
-        fmt="o",
-        color="#b91c1c",
-        ecolor="#ef4444",
-        capsize=2,
-    )
+    ax.hlines(y, top["cumulative_expected_imports_q025"], top["cumulative_expected_imports_q975"], color="#ef4444", linewidth=1.2)
+    ax.scatter(top["cumulative_expected_imports_mean"], y, color="#b91c1c", s=20, zorder=3)
     ax.set_yticks(y, top["country"])
     ax.set_xlabel("Cumulative expected introductions")
     ax.set_title("Source-country ranking", loc="left", fontweight="bold")
@@ -173,56 +164,30 @@ def make_calibration_figure(model_dir: Path, figure_dir: Path, observed_file: Pa
     dates = pd.to_datetime(draws["dates"])
     model_draws = draws["overall_expected_imports"].astype(float)
     observed = load_observed_weekly(observed_file, dates)
-    shape = 0.5 + observed.sum()
-    rate = np.maximum(model_draws.sum(axis=1), np.finfo(float).tiny)
-    alpha = np.random.default_rng(seed).gamma(shape=shape, scale=1.0 / rate)
-    calibrated = alpha[:, None] * model_draws
-    predictive = np.random.default_rng(seed + 1).poisson(np.clip(calibrated, 0, 1e7))
-    expected_mean = calibrated.mean(axis=0)
-    expected_q025 = np.quantile(calibrated, 0.025, axis=0)
-    expected_q975 = np.quantile(calibrated, 0.975, axis=0)
-    predictive_q025 = np.quantile(predictive, 0.025, axis=0)
-    predictive_q975 = np.quantile(predictive, 0.975, axis=0)
-    result = pd.DataFrame(
-        {
-            "date": dates,
-            "observed_cases": observed,
-            "calibrated_expected_mean": expected_mean,
-            "calibrated_expected_q025": expected_q025,
-            "calibrated_expected_q975": expected_q975,
-            "predictive_q025": predictive_q025,
-            "predictive_q975": predictive_q975,
-        }
-    )
+    summary = pd.read_csv(model_dir / "weekly_summary.csv", parse_dates=["date"])
+    mask = ~summary["right_truncated"].astype(bool).to_numpy()
+    dates = dates[mask]
+    model_draws = model_draws[:, mask]
+    observed = observed[mask]
+    observed_total = float(observed.sum())
+    model_total = float(model_draws.sum(axis=1).mean())
+    if model_total <= 0 or observed_total <= 0:
+        raise ValueError("Exploratory scaling requires positive model and observed totals.")
+    alpha = observed_total / model_total
+    raw_curve = model_draws.mean(axis=0).cumsum()
+    calibrated_curve = raw_curve * alpha
+    result = pd.DataFrame({"date": dates, "observed_cumulative_cases": observed.cumsum(), "model_cumulative_expected_imports": raw_curve, "calibrated_cumulative_expected_imports": calibrated_curve})
     result.to_csv(model_dir / "calibration_weekly.csv", index=False)
-    alpha_summary = pd.DataFrame(
-        {
-            "metric": ["alpha", "observed_total"],
-            "mean": [alpha.mean(), observed.sum()],
-            "q025": [np.quantile(alpha, 0.025), observed.sum()],
-            "q975": [np.quantile(alpha, 0.975), observed.sum()],
-        }
-    )
-    alpha_summary.to_csv(model_dir / "calibration_summary.csv", index=False)
-    fig, axes = plt.subplots(2, 1, figsize=(8.0, 6.0), sharex=True, gridspec_kw={"hspace": 0.16})
-    ax = axes[0]
-    ax.bar(dates, observed, width=5.2, color="#1f2937", label="Observed")
-    ax.plot(dates, expected_mean, color="#b91c1c", label="Calibrated expected introductions")
-    ax.fill_between(dates, predictive_q025, predictive_q975, color="#ef4444", alpha=0.18, linewidth=0, label="95% posterior predictive interval")
-    ax.set_ylabel("Cases per week")
-    ax.legend(frameon=False)
-    ax.set_title("A. Calibration against observed imported cases", loc="left", fontweight="bold")
-    style_axes(ax)
-    ax = axes[1]
-    cumulative_expected = result["calibrated_expected_mean"].cumsum()
-    cumulative_observed = result["observed_cases"].cumsum()
-    ax.plot(dates, cumulative_expected, color="#b91c1c", label="Calibrated cumulative estimate")
-    ax.step(dates, cumulative_observed, where="post", color="#1f2937", label="Observed cumulative cases")
-    ax.set_ylabel("Cumulative cases")
+    pd.DataFrame([{"observed_total": observed_total, "uncalibrated_total": model_total, "scaling_factor": alpha, "calibrated_total": float(calibrated_curve[-1]), "method": "same-data endpoint matching"}]).to_csv(model_dir / "calibration_summary.csv", index=False)
+    fig, ax = plt.subplots(figsize=(8.0, 4.5))
+    ax.step(dates, observed.cumsum(), where="post", color="#111827", label="Observed cumulative imports")
+    ax.plot(dates, raw_curve, color="#d94a48", linestyle="--", label="Uncalibrated model")
+    ax.plot(dates, calibrated_curve, color="#b91c1c", label="Calibrated model (endpoint matched)")
+    ax.set_ylabel("Cumulative imports")
     ax.set_xlabel("Week")
+    ax.set_title("D. Exploratory calibration of cumulative imports", loc="left", fontweight="bold")
     ax.legend(frameon=False)
-    ax.set_title("B. Cumulative comparison", loc="left", fontweight="bold")
-    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=4))
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
     style_axes(ax)
     save_figure(fig, figure_dir, "calibrated_importation_model")
@@ -239,24 +204,47 @@ def make_world_map(model_dir: Path, figure_dir: Path, shapefile: Path, country_m
         mapping = mapping.rename(columns={mapping.columns[0]: "country", mapping.columns[1]: "iso3"})
         summary = summary.merge(mapping[["country", "iso3"]], on="country", how="left")
     else:
-        summary["iso3"] = summary["country"]
-    shape_iso = next((name for name in ("ISO_A3", "ADM0_A3", "iso_a3") if name in shapes.columns), None)
+        from countries import canonical_country
+        who = pd.read_csv(Path(__file__).resolve().parent / "data/who/WHO_global_mpox_cases_2025-12-31.csv", usecols=["COUNTRY", "ISO3"])
+        who["country"] = who["COUNTRY"].map(canonical_country)
+        lookup = who.drop_duplicates("country").set_index("country")["ISO3"]
+        summary["iso3"] = summary["country"].map(lookup)
+    if summary["iso3"].isna().any():
+        raise ValueError("ISO3 mappings are missing for some retained source countries.")
+    summary["contribution_percent"] = summary["contribution_fraction_mean"] * 100
+    shape_iso = next((name for name in ("ADM0_A3", "ISO_A3", "iso_a3") if name in shapes.columns), None)
     if shape_iso is None:
         raise ValueError("The shapefile must contain an ISO3 column or a country mapping file must be supplied.")
-    merged = shapes.merge(summary[["iso3", "cumulative_expected_imports_mean"]], left_on=shape_iso, right_on="iso3", how="left")
+    merged = shapes.merge(summary[["iso3", "contribution_percent"]], left_on=shape_iso, right_on="iso3", how="left")
     fig, ax = plt.subplots(figsize=(12.0, 6.4))
     merged.plot(
         ax=ax,
-        column="cumulative_expected_imports_mean",
+        column="contribution_percent",
         cmap="Reds",
         linewidth=0.3,
         edgecolor="white",
         legend=True,
+        legend_kwds={"label": "Share of cumulative expected introductions (%)"},
         missing_kwds={"color": "#eeeeee"},
     )
     ax.set_axis_off()
-    ax.set_title("Cumulative expected mpox introductions by source country", loc="left", fontweight="bold")
+    ax.set_title("C. Source-country shares of cumulative expected introductions", loc="left", fontweight="bold")
     save_figure(fig, figure_dir, "world_map_cumulative_importation")
+
+
+def make_predictive_figures(model_dir: Path, figure_dir: Path) -> None:
+    for path in sorted((model_dir / "diagnostics").glob("*_ppc.csv")):
+        frame = pd.read_csv(path, parse_dates=["date"])
+        fig, ax = plt.subplots(figsize=(8, 3))
+        ax.fill_between(frame["date"], frame["ppc_reported_lower_95"], frame["ppc_reported_upper_95"], color="#B8DDF0", alpha=.8, label="95% predictive interval")
+        ax.plot(frame["date"], frame["ppc_reported_median"], color="#D55E00", label="Posterior predictive median")
+        ax.step(frame["date"], frame["reported_cases"], where="mid", color="#174A73", label="Observed")
+        ax.set_title(path.stem.removesuffix("_ppc").replace("_", " "))
+        ax.set_ylabel("Weekly reported cases")
+        ax.set_xlabel("Week")
+        ax.legend(frameon=False, fontsize=8)
+        style_axes(ax)
+        save_figure(fig, figure_dir / "posterior_predictive", path.stem)
 
 
 def generate_figures(
@@ -270,6 +258,7 @@ def generate_figures(
     make_country_weekly_summary(model_dir)
     make_temporal_figure(model_dir, figure_dir)
     make_country_figure(model_dir, figure_dir)
+    make_predictive_figures(model_dir, figure_dir)
     if observed_file is not None:
         make_calibration_figure(model_dir, figure_dir, observed_file, seed)
     if shapefile is not None:

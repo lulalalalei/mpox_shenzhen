@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 import pandas as pd
+from countries import canonical_country
 
 
 def pick_column(frame: pd.DataFrame, candidates: tuple[str, ...], label: str) -> str:
@@ -63,10 +64,10 @@ def build_weekly_passengers(
         }
     )
     capacity["date"] = pd.to_datetime(capacity["date"], format="mixed", errors="coerce")
-    capacity["seats"] = pd.to_numeric(capacity["seats"], errors="coerce")
+    capacity["seats"] = pd.to_numeric(capacity["seats"].astype(str).str.replace(",", "", regex=False), errors="coerce")
     capacity = capacity.dropna()
     capacity = capacity.loc[capacity["seats"] >= 0].copy()
-    capacity["country"] = capacity["country"].astype(str).str.strip()
+    capacity["country"] = capacity["country"].map(canonical_country)
     capacity = capacity.loc[capacity["country"].ne("China")]
     capacity["month"] = capacity["date"].dt.to_period("M")
     capacity["monthly_seats"] = capacity.groupby(["country", "month"])["seats"].transform("sum")
@@ -97,7 +98,7 @@ def build_weekly_passengers(
             passenger_count: "monthly_passengers",
         }
     )
-    passengers["country"] = passengers["country"].astype(str).str.strip()
+    passengers["country"] = passengers["country"].map(canonical_country)
     passengers = passengers.loc[passengers["country"].ne("China")]
     passengers["month_date"] = parse_mixed_month(passengers["month_date"])
     passengers["monthly_passengers"] = (
@@ -123,7 +124,12 @@ def build_weekly_passengers(
     }
     capacity["country"] = capacity["country"].replace(mapping)
     passengers["country"] = passengers["country"].replace(mapping)
-    merged = capacity.merge(passengers, on=["country", "month"], how="inner")
+    covered = capacity[["country", "month"]].drop_duplicates()
+    needed = passengers.loc[(passengers["monthly_passengers"] > 0) & (passengers["month"] >= start.to_period("M")) & (passengers["month"] <= end.to_period("M"))]
+    missing = needed.merge(covered, on=["country", "month"], how="left", indicator=True)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    missing.loc[missing["_merge"].eq("left_only")].drop(columns="_merge").to_csv(output_file.with_name(output_file.stem + "_unmatched_country_months.csv"), index=False)
+    merged = capacity.merge(passengers, on=["country", "month"], how="inner", validate="many_to_one")
     if merged.empty:
         raise ValueError("The transport and passenger tables have no matching country-month rows.")
     merged["estimated_passengers"] = merged["share"] * merged["monthly_passengers"]

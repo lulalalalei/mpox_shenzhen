@@ -3,23 +3,25 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
 
 def combine_panels(panel_files: list[Path], output_dir: Path, stem: str) -> None:
-    images = [Image.open(path).convert("RGB") for path in panel_files]
+    if not panel_files:
+        raise ValueError("At least one figure is required.")
+    images = []
+    for path in panel_files:
+        with Image.open(path) as source:
+            images.append(source.convert("RGB"))
     width = max(image.width for image in images)
     gap = 24
-    label_width = 64
+    label_width = 0
     heights = [round(image.height * width / image.width) for image in images]
     resized = [image.resize((width, height), Image.Resampling.LANCZOS) for image, height in zip(images, heights)]
     canvas = Image.new("RGB", (width + label_width, sum(heights) + gap * (len(images) - 1)), "white")
-    draw = ImageDraw.Draw(canvas)
-    font = ImageFont.load_default()
     y = 0
     for index, image in enumerate(resized):
         canvas.paste(image, (label_width, y))
-        draw.text((16, y + 12), chr(65 + index), fill="black", font=font)
         y += image.height + gap
     output_dir.mkdir(parents=True, exist_ok=True)
     canvas.save(output_dir / f"{stem}.png", dpi=(300, 300))
